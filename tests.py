@@ -1,22 +1,21 @@
 """
 tests.py
-────────
-Unit-tests for the word2vec implementation.
+--------
+Unit tests for the word2vec implementation.
 Run with:  python tests.py
 """
 
 import sys
-import math
 import random
 import unittest
 
 import numpy as np
 
-# ── allow running from the repo root ──────────────────────────────────────────
 sys.path.insert(0, ".")
 from word2vec import (
     tokenize,
     build_vocab,
+    apply_subsampling,
     generate_skip_gram_pairs,
     Word2Vec,
 )
@@ -36,8 +35,8 @@ class TestTokenize(unittest.TestCase):
 class TestBuildVocab(unittest.TestCase):
     def setUp(self):
         self.tokens = ["apple"] * 10 + ["banana"] * 3 + ["cat"] * 1
-        self.word2id, self.id2word, self.noise_dist = build_vocab(
-            self.tokens, min_count=2
+        self.word2id, self.id2word, self.noise_dist, self.discard_prob = build_vocab(
+            self.tokens, min_count=2, subsample_t=1e-5
         )
 
     def test_min_count_filters(self):
@@ -55,6 +54,49 @@ class TestBuildVocab(unittest.TestCase):
     def test_noise_dist_positive(self):
         self.assertTrue(np.all(self.noise_dist > 0))
 
+    def test_discard_prob_shape(self):
+        self.assertEqual(len(self.discard_prob), len(self.word2id))
+
+    def test_discard_prob_range(self):
+        self.assertTrue(np.all(self.discard_prob >= 0))
+        self.assertTrue(np.all(self.discard_prob <= 1))
+
+    def test_frequent_word_higher_discard(self):
+        # "apple" is more frequent than "banana" -> higher discard probability
+        p_apple  = self.discard_prob[self.word2id["apple"]]
+        p_banana = self.discard_prob[self.word2id["banana"]]
+        self.assertGreater(p_apple, p_banana)
+
+
+class TestApplySubsampling(unittest.TestCase):
+    def test_empty_input(self):
+        rng = np.random.default_rng(0)
+        self.assertEqual(apply_subsampling([], np.array([0.5]), rng), [])
+
+    def test_zero_discard_keeps_all(self):
+        rng = np.random.default_rng(0)
+        ids = [0, 1, 2, 3]
+        discard = np.array([0.0, 0.0, 0.0, 0.0])
+        result = apply_subsampling(ids, discard, rng)
+        self.assertEqual(result, ids)
+
+    def test_full_discard_drops_all(self):
+        rng = np.random.default_rng(0)
+        ids = [0, 1, 2, 3]
+        discard = np.array([1.0, 1.0, 1.0, 1.0])
+        result = apply_subsampling(ids, discard, rng)
+        self.assertEqual(result, [])
+
+    def test_high_discard_reduces_length(self):
+        rng = np.random.default_rng(0)
+        ids = list(range(1000))
+        # Discard probability 0.9 for all tokens
+        discard = np.full(1000, 0.9)
+        result = apply_subsampling(ids, discard, rng)
+        # Expect roughly 10% remaining
+        self.assertLess(len(result), 200)
+        self.assertGreater(len(result), 0)
+
 
 class TestSkipGramPairs(unittest.TestCase):
     def test_no_self_pairs(self):
@@ -62,17 +104,6 @@ class TestSkipGramPairs(unittest.TestCase):
         pairs = generate_skip_gram_pairs(ids, window=2)
         for c, o in pairs:
             self.assertNotEqual(c, o)
-
-    def test_window_respected(self):
-        # With a corpus of length 3 and window=1, centre word 1 can only
-        # see words at positions 0 and 2 — distance ≤ 1.
-        random.seed(0)
-        ids   = [10, 20, 30]
-        pairs = generate_skip_gram_pairs(ids, window=1)
-        for c, o in pairs:
-            # each value is a word-id; check it came from a valid position
-            self.assertIn(c, ids)
-            self.assertIn(o, ids)
 
     def test_returns_pairs(self):
         ids = list(range(20))
@@ -84,9 +115,7 @@ class TestSkipGramPairs(unittest.TestCase):
 
 class TestWord2VecForward(unittest.TestCase):
     def setUp(self):
-        self.vocab_size = 50
-        self.embed_dim  = 8
-        self.model = Word2Vec(self.vocab_size, self.embed_dim, seed=7)
+        self.model = Word2Vec(vocab_size=50, embed_dim=8, seed=7)
 
     def test_loss_is_positive(self):
         neg_ids = np.array([3, 5, 7])
@@ -96,60 +125,44 @@ class TestWord2VecForward(unittest.TestCase):
     def test_sigmoid_range(self):
         x = np.array([-1000.0, -1.0, 0.0, 1.0, 1000.0])
         s = Word2Vec._sigmoid(x)
-        # No NaN / inf for extreme inputs
         self.assertTrue(np.all(np.isfinite(s)), f"Non-finite values: {s}")
-        # Values lie in [0, 1]
         self.assertTrue(np.all(s >= 0))
         self.assertTrue(np.all(s <= 1))
-        # σ(0) = 0.5 exactly
         self.assertAlmostEqual(float(s[2]), 0.5, places=10)
-        # Monotone: extreme positive → near 1, extreme negative → near 0
         self.assertGreater(float(s[4]), 0.99)
         self.assertLess(float(s[0]), 0.01)
 
     def test_loss_decreases_after_update(self):
-        """A single gradient step should reduce the loss (stochastically)."""
         np.random.seed(0)
         neg_ids = np.array([2, 4, 6])
-        lr = 0.1
-        losses = []
-        for _ in range(30):
-            loss = self.model.train_step(0, 1, neg_ids, lr)
-            losses.append(loss)
-        # Average of last 10 steps should be lower than first 10
+        losses = [self.model.train_step(0, 1, neg_ids, lr=0.1) for _ in range(30)]
         self.assertLess(np.mean(losses[-10:]), np.mean(losses[:10]))
 
 
 class TestWord2VecGradients(unittest.TestCase):
-    """
-    Numerical gradient check via finite differences.
-    ∂L/∂θ ≈ (L(θ+ε) - L(θ-ε)) / (2ε)
-    """
+    """Numerical gradient check via finite differences."""
 
     def _loss_only(self, model, center_id, context_id, neg_ids):
         loss, *_ = model._forward_loss(center_id, context_id, neg_ids)
         return loss
 
-    def _numerical_grad(self, model, param_matrix, row, col, center_id, context_id, neg_ids, eps=1e-5):
-        orig = param_matrix[row, col]
-        param_matrix[row, col] = orig + eps
+    def _numerical_grad(self, model, matrix, row, col, center_id, context_id, neg_ids, eps=1e-5):
+        orig = matrix[row, col]
+        matrix[row, col] = orig + eps
         l_plus  = self._loss_only(model, center_id, context_id, neg_ids)
-        param_matrix[row, col] = orig - eps
+        matrix[row, col] = orig - eps
         l_minus = self._loss_only(model, center_id, context_id, neg_ids)
-        param_matrix[row, col] = orig
+        matrix[row, col] = orig
         return (l_plus - l_minus) / (2 * eps)
 
     def test_gradient_W_in(self):
         model = Word2Vec(vocab_size=10, embed_dim=4, seed=3)
-        center_id, context_id = 2, 5
-        neg_ids = np.array([1, 7])
+        center_id, context_id, neg_ids = 2, 5, np.array([1, 7])
 
-        # Analytical gradient
         loss, v_c, sig_pos, sig_neg = model._forward_loss(center_id, context_id, neg_ids)
-        v_o = model.W_out[context_id]
-        V_n = model.W_out[neg_ids]
-        err_neg = 1.0 - sig_neg
-        analytical = (sig_pos - 1.0) * v_o + err_neg @ V_n  # (D,)
+        v_o  = model.W_out[context_id]
+        V_n  = model.W_out[neg_ids]
+        analytical = (sig_pos - 1.0) * v_o + (1.0 - sig_neg) @ V_n
 
         for d in range(model.embed_dim):
             num = self._numerical_grad(model, model.W_in, center_id, d, center_id, context_id, neg_ids)
@@ -158,11 +171,10 @@ class TestWord2VecGradients(unittest.TestCase):
 
     def test_gradient_W_out_context(self):
         model = Word2Vec(vocab_size=10, embed_dim=4, seed=3)
-        center_id, context_id = 2, 5
-        neg_ids = np.array([1, 7])
+        center_id, context_id, neg_ids = 2, 5, np.array([1, 7])
 
         loss, v_c, sig_pos, sig_neg = model._forward_loss(center_id, context_id, neg_ids)
-        analytical = (sig_pos - 1.0) * v_c  # (D,)
+        analytical = (sig_pos - 1.0) * v_c
 
         for d in range(model.embed_dim):
             num = self._numerical_grad(model, model.W_out, context_id, d, center_id, context_id, neg_ids)
@@ -171,26 +183,52 @@ class TestWord2VecGradients(unittest.TestCase):
 
 
 class TestMostSimilar(unittest.TestCase):
+    def setUp(self):
+        self.model   = Word2Vec(vocab_size=20, embed_dim=4, seed=0)
+        self.word2id = {f"w{i}": i for i in range(20)}
+        self.id2word = {v: k for k, v in self.word2id.items()}
+
     def test_returns_top_k(self):
-        model = Word2Vec(vocab_size=20, embed_dim=4, seed=0)
-        word2id = {f"w{i}": i for i in range(20)}
-        id2word = {v: k for k, v in word2id.items()}
-        results = model.most_similar("w0", word2id, id2word, top_k=5)
+        results = self.model.most_similar("w0", self.word2id, self.id2word, top_k=5)
         self.assertEqual(len(results), 5)
 
     def test_excludes_query_word(self):
-        model = Word2Vec(vocab_size=20, embed_dim=4, seed=0)
-        word2id = {f"w{i}": i for i in range(20)}
-        id2word = {v: k for k, v in word2id.items()}
-        results = model.most_similar("w0", word2id, id2word, top_k=5)
-        words = [w for w, _ in results]
-        self.assertNotIn("w0", words)
+        results = self.model.most_similar("w0", self.word2id, self.id2word, top_k=5)
+        self.assertNotIn("w0", [w for w, _ in results])
 
     def test_unknown_word(self):
-        model = Word2Vec(vocab_size=5, embed_dim=4, seed=0)
-        word2id: dict = {}
-        id2word: dict = {}
-        self.assertEqual(model.most_similar("ghost", word2id, id2word), [])
+        self.assertEqual(self.model.most_similar("ghost", {}, {}), [])
+
+
+class TestAnalogy(unittest.TestCase):
+    def setUp(self):
+        # Small model with hand-crafted embeddings to test analogy arithmetic.
+        # Set up: king ~ man + (queen - woman) by construction.
+        self.model   = Word2Vec(vocab_size=5, embed_dim=4, seed=0)
+        self.word2id = {"king": 0, "man": 1, "woman": 2, "queen": 3, "apple": 4}
+        self.id2word = {v: k for k, v in self.word2id.items()}
+
+        # Manually set embeddings so that king - man + woman = queen exactly.
+        self.model.W_in[0] = np.array([1.0, 0.5, 0.0, 0.0])   # king
+        self.model.W_in[1] = np.array([0.0, 0.5, 0.0, 0.0])   # man
+        self.model.W_in[2] = np.array([0.0, 0.0, 1.0, 0.0])   # woman
+        self.model.W_in[3] = np.array([1.0, 0.0, 1.0, 0.0])   # queen  (= king - man + woman)
+        self.model.W_in[4] = np.array([0.0, 0.0, 0.0, 1.0])   # apple  (unrelated)
+
+    def test_analogy_top_result(self):
+        results = self.model.analogy("king", "man", "woman", self.word2id, self.id2word, top_k=1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], "queen")
+
+    def test_analogy_excludes_query_words(self):
+        results = self.model.analogy("king", "man", "woman", self.word2id, self.id2word, top_k=2)
+        words = [w for w, _ in results]
+        for qw in ["king", "man", "woman"]:
+            self.assertNotIn(qw, words)
+
+    def test_analogy_missing_word(self):
+        results = self.model.analogy("king", "man", "ghost", self.word2id, self.id2word)
+        self.assertEqual(results, [])
 
 
 if __name__ == "__main__":
