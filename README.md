@@ -115,6 +115,10 @@ up training.
 ## Results
 
 Trained on *War and Peace* (Tolstoy, Project Gutenberg) — 580k tokens, vocab 6,705, 3 epochs.
+The corpus is literary fiction (~580k tokens) — too small and too domain-specific 
+for geographic or cultural analogies. The model correctly learns morphological and 
+gender relations (man/woman, better/worse) but not encyclopedic knowledge, which 
+requires Wikipedia-scale data.
 
 ### Nearest neighbours
 ```

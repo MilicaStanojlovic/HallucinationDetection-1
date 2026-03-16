@@ -34,7 +34,7 @@ def tokenize(text: str) -> list[str]:
 def build_vocab(
     tokens: list[str],
     min_count: int = 5,
-    subsample_t: float = 1e-5,
+    subsample_t: float = 1e-3,
 ) -> tuple[dict[str, int], dict[int, str], np.ndarray, np.ndarray]:
     """
     Build word->id and id->word mappings, noise distribution for negative
@@ -48,7 +48,7 @@ def build_vocab(
 
         P(discard w) = 1 - sqrt(t / f(w))
 
-    where f(w) = count(w) / total_tokens and t is a threshold (default 1e-5).
+    where f(w) = count(w) / total_tokens and t is a threshold (default 1e-3).
     Words with f(w) <= t are never discarded.  This makes rare words relatively
     more influential and speeds up training significantly.
 
@@ -345,7 +345,7 @@ def train(
     lr_start: float    = 0.025,
     lr_min: float      = 0.0001,
     min_count: int     = 5,
-    subsample_t: float = 1e-5,
+    subsample_t: float = 1e-3,
     seed: int          = 42,
     log_every: int     = 100_000,
 ) -> tuple["Word2Vec", dict[str, int], dict[int, str]]:
