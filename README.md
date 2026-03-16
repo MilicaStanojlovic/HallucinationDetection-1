@@ -112,6 +112,29 @@ up training.
 
 ---
 
+## Results
+
+Trained on *War and Peace* (Tolstoy, Project Gutenberg) — 580k tokens, vocab 6,705, 3 epochs.
+
+### Nearest neighbours
+```
+man   → woman (0.800), child (0.730), young (0.725)
+woman → child (0.918), girl (0.903), lady (0.884)
+war   → russia (0.926), austria (0.908), government (0.909)
+```
+
+### Analogies (a − b + c = ?)
+```
+better − good + bad  →  worse (0.894)  ✓
+war − peace + love   →  pity (0.886), sacrifice (0.874)
+```
+
+Results reflect the literary domain of the corpus — geographic and political
+analogies (e.g. paris − france + england) are weak because place names appear
+as character references rather than geographic concepts in the novel.
+
+---
+
 ## References
 
 - Mikolov et al. (2013). *Efficient Estimation of Word Representations in Vector Space.* arXiv:1301.3781
